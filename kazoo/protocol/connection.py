@@ -13,7 +13,8 @@ from kazoo.exceptions import (
     ConnectionDropped,
     EXCEPTIONS,
     SessionExpiredError,
-    NoNodeError
+    NoNodeError,
+    SaslException,
 )
 from kazoo.loggingsupport import BLATHER
 from kazoo.protocol.serialization import (
@@ -25,9 +26,10 @@ from kazoo.protocol.serialization import (
     Ping,
     PingInstance,
     ReplyHeader,
+    SASL,
     Transaction,
     Watch,
-    int_struct
+    int_struct,
 )
 from kazoo.protocol.states import (
     Callback,
@@ -37,9 +39,15 @@ from kazoo.protocol.states import (
 )
 from kazoo.retry import (
     ForceRetryError,
-    RetryFailedError
+    RetryFailedError,
 )
 
+try:
+    import puresasl as sasl
+    import puresasl.client as sasl_client
+    _has_sasl = True
+except ImportError:
+    _has_sasl = False
 
 log = logging.getLogger(__name__)
 
@@ -131,11 +139,12 @@ class RWServerAvailable(Exception):
 
 class ConnectionHandler(object):
     """Zookeeper connection handler"""
-    def __init__(self, client, retry_sleeper, logger=None):
+    def __init__(self, client, retry_sleeper, logger=None, sasl_data=None):
         self.client = client
         self.handler = client.handler
         self.retry_sleeper = retry_sleeper
         self.logger = logger or log
+        self.sasl_data = sasl_data
 
         # Our event objects
         self.connection_closed = client.handler.event_object()
@@ -153,6 +162,7 @@ class ConnectionHandler(object):
         self._ro_mode = False
 
         self._connection_routine = None
+
 
     # This is instance specific to avoid odd thread bug issues in Python
     # during shutdown global cleanup
@@ -485,12 +495,13 @@ class ConnectionHandler(object):
         host_ports = []
         for host, port in self.client.hosts:
             try:
-                for rhost in socket.getaddrinfo(host.strip(), port, 0, 0,
+                host = host.strip()
+                for rhost in socket.getaddrinfo(host, port, 0, 0,
                                                 socket.IPPROTO_TCP):
-                    host_ports.append((rhost[4][0], rhost[4][1]))
+                    host_ports.append((host, rhost[4][0], rhost[4][1]))
             except socket.gaierror as e:
                 # Skip hosts that don't resolve
-                self.logger.warning("Cannot resolve %s: %s", host.strip(), e)
+                self.logger.warning("Cannot resolve %s: %s", host, e)
                 pass
         if self.client.randomize_hosts:
             random.shuffle(host_ports)
@@ -505,11 +516,11 @@ class ConnectionHandler(object):
         if len(host_ports) == 0:
             return STOP_CONNECTING
 
-        for host, port in host_ports:
+        for host, hostip, port in host_ports:
             if self.client._stopped.is_set():
                 status = STOP_CONNECTING
                 break
-            status = self._connect_attempt(host, port, retry)
+            status = self._connect_attempt(host, hostip, port, retry)
             if status is STOP_CONNECTING:
                 break
 
@@ -518,7 +529,7 @@ class ConnectionHandler(object):
         else:
             raise ForceRetryError('Reconnecting')
 
-    def _connect_attempt(self, host, port, retry):
+    def _connect_attempt(self, host, hostip, port, retry):
         client = self.client
         KazooTimeoutError = self.handler.timeout_exception
         close_connection = False
@@ -536,7 +547,7 @@ class ConnectionHandler(object):
             client._session_callback(KeeperState.CONNECTING)
 
         try:
-            read_timeout, connect_timeout = self._connect(host, port)
+            read_timeout, connect_timeout = self._connect(host, hostip, port)
             read_timeout = read_timeout / 1000.0
             connect_timeout = connect_timeout / 1000.0
             retry.reset()
@@ -594,9 +605,9 @@ class ConnectionHandler(object):
             if self._socket is not None:
                 self._socket.close()
 
-    def _connect(self, host, port):
+    def _connect(self, host, hostip, port):
         client = self.client
-        self.logger.info('Connecting to %s:%s', host, port)
+        self.logger.info('Connecting to %s(%s):%s', host, hostip, port)
 
         self.logger.log(BLATHER,
                         '    Using session_id: %r session_passwd: %s',
@@ -605,7 +616,7 @@ class ConnectionHandler(object):
 
         with self._socket_error_handling():
             self._socket = self.handler.create_connection(
-                (host, port), client._session_timeout / 1000.0)
+                (hostip, port), client._session_timeout / 1000.0)
 
         self._socket.setblocking(0)
 
@@ -639,6 +650,9 @@ class ConnectionHandler(object):
                         negotiated_session_timeout, connect_timeout,
                         read_timeout)
 
+        if self.sasl_data is not None:
+            self._authenticate_with_sasl(host, connect_timeout / 1000.0)
+
         if connect_result.read_only:
             client._session_callback(KeeperState.CONNECTED_RO)
             self._ro_mode = iter(self._server_pinger())
@@ -653,3 +667,55 @@ class ConnectionHandler(object):
                 client.last_zxid = zxid
 
         return read_timeout, connect_timeout
+
+    def _authenticate_with_sasl(self, host, timeout):
+        """Establish a SASL authenticated connection to the server.
+        """
+        # XXX: sasl_data = {
+        # XXX:     'service': '<server_service_name>',
+        # XXX:     'mechanisms': [ 'GSSAPI' | 'DIGEST-MD5' ],
+        # XXX:     # For GSSAPI:
+        # XXX:     'client_principal': '<principal to use from keytab>'
+        # XXX: }
+        saslc = sasl_client.SASLClient(
+            host,
+            service=self.sasl_data['service'],
+            principal=self.sasl_data.get('client_principal', None),
+        )
+        # XXX: Check that it is in ['GSSAPI', 'DIGEST-MD5']
+        saslc.choose_mechanism(self.sasl_data['mechanisms'])
+
+        # Inititalize the process with an empty token
+        response = saslc.process()
+        xid = 0
+
+        while True:
+            xid += 1
+
+            request = SASL(response)
+            self._submit(request, timeout, xid)
+
+            header, buffer, offset = self._read_header(timeout)
+            if header.xid != xid:
+                raise RuntimeError('xids do not match, expected %r '
+                                   'received %r', xid, header.xid)
+
+            if header.zxid > 0:
+                self.client.last_zxid = header.zxid
+
+            if header.err:
+                callback_exception = EXCEPTIONS[header.err]()
+                self.logger.debug(
+                    'Received error(xid=%s) %r', xid, callback_exception)
+                raise callback_exception
+
+            token, _ = SASL.deserialize(buffer, offset)
+
+            if not token:
+                # FIXME: Should check saslc.complete if negotiation if complete
+                break
+
+            try:
+                response = saslc.process(challenge=token)
+            except (sasl.SASLError, sasl.SASLProtocolException) as err:
+                raise SaslException(err.message)

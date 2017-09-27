@@ -1,3 +1,13 @@
+<a name="2.4.1"></a>
+## 2.4.1 (next)
+
+#### Features
+
+* Add `sasl_server_principal` to `kazoo.client.Client`, which enables kazoo to
+  authenticate against a kerberized Zookeeper.
+
+
+
 <a name="2.4.0"></a>
 ## 2.4.0 (2017-06-14)
 
